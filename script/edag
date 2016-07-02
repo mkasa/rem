@@ -1,0 +1,312 @@
+#!/usr/bin/env ruby
+# -*- mode:ruby; ruby-indent-level:4; tab-width:4 -*-
+# vim: ts=4:sw=4
+
+require 'set'
+require 'optparse'
+require 'json'
+
+$version_string = "0.0.0"
+$home_path = `readlink -f $HOME`; $home_path.chomp!
+
+def guess_root_dir_from_inout_file(inout_file_path, config)
+    begin
+        open(inout_file_path) do |f|
+            f.each_line do |l|
+                l.chomp!
+                begin
+                    json = JSON.parse(l)
+                    next unless json.has_key?('outputs')
+                    if 0 < json['outputs'].size
+                        return expand_home(json['pwd'])
+                    end
+                rescue NoMethodError
+                    $stderr.puts "ERROR: unexpected JSON at line #{f.lineno} in #{inout_file_path}"
+                    $stderr.puts "       outputs must be an array."
+                    exit 1
+                rescue JSON::JSONError => e
+                    $stderr.puts "ERROR: JSON syntax error at line #{f.lineno} in #{inout_file_path}"
+                    $stderr.puts "       #{e.message}"
+                    exit 1
+                end
+            end
+        end
+    rescue Errno::ENOENT => _
+        $stderr.puts "ERROR: #{inout_file_path} does not exist."
+    rescue => e
+        $stderr.puts "ERROR: #{ e.message}"
+    end
+    return nil
+end
+
+def expand_home(path)
+    if path.start_with?("~/")
+        path = $home_path + "/" + path[2..-1]
+    end
+    return path
+end
+
+def absolute_path_to_relative_path(path, base)
+    path = expand_home(path)
+    if base.nil? || base.empty? then return path end
+    original_base = base
+    until base.nil? || base.empty? || base == "/"
+        unless %r!^/([^/]*)(/.*)?$! =~ base
+            $stderr.puts "ERROR: bad base path (#{original_base})"
+            exit 1
+        end
+        dir_name = $1
+        base = $2
+        if path.start_with?("/" << dir_name << "/")
+            path.sub!(%r!^/[^/]*!, "")
+        else
+            if path.start_with?("/")
+                path = ".." << path
+            else
+                path = "../" << path
+            end
+        end
+    end
+    path.sub!(%r!^/!, "")
+end
+
+def extract_dag_from_inout_file(inout_file_path, config)
+    tasks = []
+    begin
+        open(inout_file_path) do |f|
+            f.each_line do |l|
+                l.chomp!
+                begin
+                    json = JSON.parse(l)
+                    next unless json.has_key?('outputs')
+                    next unless 0 < json['outputs'].size
+                    unless json.has_key?('cmd') then $stderr.puts "ERROR: 'cmd' is missing at line #{f.lineno}"; exit 1; end
+                    unless json.has_key?('exec_time') then $stderr.puts "ERROR: 'exec_time' is missing at line #{f.lineno}"; exit 1; end
+                    unless json.has_key?('inputs') then $stderr.puts "ERROR: 'inputs' is missing at line #{f.lineno}"; exit 1; end
+                    unless json.has_key?('outputs') then $stderr.puts "ERROR: 'outputs' is missing at line #{f.lineno}"; exit 1; end
+                rescue NoMethodError
+                    $stderr.puts "ERROR: unexpected JSON at line #{f.lineno}"
+                    $stderr.puts "       outputs must be an array."
+                    exit 1
+                rescue JSON::JSONError => e
+                    $stderr.puts "ERROR: JSON syntax error at line #{f.lineno}"
+                    $stderr.puts "       #{e.message}"
+                    exit 1
+                end
+                next if !config[:include_failed] && config.fetch('retcode', 0) != 0
+                filter_file_path = lambda { |fn|
+                    return true if config[:include_systemfile]
+                    return false if !config[:include_tempfile] &&  fn.start_with?("/tmp/")
+                    system_directories = ["proc", "sys", "dev", "usr", "bin", "sbin", "etc", "var", "opt", "lib", "lib64", "boot"]
+                    system_directories.each do |x|
+                        return false if fn.start_with?("/#{x}/")
+                    end
+                    return true
+                }
+                task = {
+                    :cmdline => json['cmd'],
+                    :inputs  => json['inputs'].select {|fn| filter_file_path.call(fn) }.map {|fn| absolute_path_to_relative_path(fn, config[:root])},
+                    :outputs => json['outputs'].select {|fn| filter_file_path.call(fn) }.map {|fn| absolute_path_to_relative_path(fn, config[:root])},
+                    :temps   => json['temps'].select {|fn| filter_file_path.call(fn) }.map {|fn| absolute_path_to_relative_path(fn, config[:root])},
+                    :exec_time => json['exec_time']
+                }
+                tasks << task
+            end
+        end
+    rescue Errno::ENOENT
+        $stderr.puts "ERROR: #{inout_file_path} does not exist."
+    end
+    return tasks
+end
+
+def find_real_inout_files(tasks)
+    input_files = Hash.new(0)
+    output_files = Hash.new(0)
+    tasks.each do |task|
+        task[:inputs].each { |fn| input_files[fn] += 1 }
+        task[:outputs].each { |fn| output_files[fn] += 1 }
+    end
+    real_inputs = []
+    real_outputs = []
+    tasks.each do |task|
+        real_inputs.concat(task[:inputs].select{|fn| !output_files.has_key?(fn) })
+        real_outputs.concat(task[:outputs].select{|fn| !input_files.has_key?(fn) })
+    end
+    return real_inputs, real_outputs
+end
+
+def generate_makefile(config, tasks, real_inputs_array, real_outputs_array)
+    real_inputs = Set.new real_inputs_array
+    real_outputs = Set.new real_outputs_array
+    internal_files = Set.new
+    tasks.each do |task|
+        internal_files.merge(task[:outputs].select{ |fn| !real_outputs.include?(fn) })
+    end
+    file_name_2_merged_file_name = {}
+    tasks.each do |task|
+        next if task[:outputs].size < 2
+        unmerged_files = []
+        task[:outputs].each do |fn|
+            unmerged_files << fn unless file_name_2_merged_file_name.has_key?(fn)
+        end
+        next if unmerged_files.size <= 0
+        if unmerged_files.size == 1
+            # nothing to do
+        else
+            target = unmerged_files.shift
+            unmerged_files.each { |fn| file_name_2_merged_file_name[fn] = target }
+        end
+    end
+    compress_to_merged_target = lambda do |file_names|
+        compressed_file_names = Set.new
+        file_names.each do |fn|
+            compressed_file_names << file_name_2_merged_file_name.fetch(fn, fn)
+        end
+        return compressed_file_names.to_a
+    end
+    begin
+        open(config[:makefile], "w") do |f|
+            f.puts "#"
+            f.puts "# This file is created by edag version #{$version_string}"
+            f.puts "#"
+            f.puts ""
+            f.puts "INPUT_FILES = " + real_inputs_array.join(' ')
+            f.puts "OUTPUT_FILES = " + real_outputs_array.join(' ')
+            f.puts "INTERNAL_FILES = " + internal_files.to_a.join(' ')
+            f.puts ""
+            f.puts "all: $(OUTPUT_FILES)"
+            f.puts ""
+            f.puts "show_inputs:"
+            f.puts "\techo $(INPUT_FILES)"
+            f.puts ""
+            f.puts "show_outputs:"
+            f.puts "\techo $(OUTPUT_FILES)"
+            f.puts ""
+            f.puts "clean:"
+            f.puts "\t-rm -f $(INTERNAL_FILES)"
+            f.puts ""
+            f.puts "distclean: clean"
+            f.puts "\t-rm -f $(OUTPUT_FILES)"
+            f.puts ""
+            tasks.each do |task|
+                # f.puts task[:outputs].join(' ') + ": " + task[:inputs].join(' ')
+                f.puts compress_to_merged_target.call(task[:outputs]).join(' ') + ": " + compress_to_merged_target.call(task[:inputs]).join(' ')
+                f.puts "\t" << task[:cmdline]
+                f.puts ""
+            end
+        end
+    rescue Errno::EACCES
+        $stderr.puts "ERROR: Cannot open '#{config[:makefile]}'"
+        exit 1
+    end
+    print "Successfully generated #{config[:makefile]}\n"
+end
+
+def main()
+    if ARGV.size < 1
+        $stderr.puts "usage: edag [options ...] <inout file>"
+        exit 1
+    end
+
+    configuration = {
+        :root => nil, # the root working directory
+        :makefile => nil, # the file name of Makefile, which is going to be output
+        :force => false, # overwrite existing files if needed
+        :output_type => 'makefile', # output file type
+        :include_systemfile => false, # include system files in dependencies
+        :include_tempfile => false, # include temporary file (/tmp/*) in dependencies
+        :include_failed => false # include dependencies caused from failed command lines
+    }
+    opt = OptionParser.new
+    opt.on('-r rootdir') { |v| configuration[:root] = v }
+    opt.on('-f makefile_name') { |v| configuration[:makefile] = v }
+    opt.on('-t type') do |v|
+        if v != "make" && v != "tce"
+            $stderr.puts "ERROR: -t takes only one of the followings."
+            $stderr.puts "   makefile, tce"
+            exit 1
+        end
+        configuration[:output_type] = v
+    end
+    opt.on('--force') { configuration[:force] = true }
+    opt.on('--system') { configuration[:include_systemfile] = true }
+    opt.on('--temp') { configuration[:include_tempfile] = true }
+    opt.on('--failed') { configuration[:include_failed] = true }
+    opt.on('--debug') { $debug = 1 }
+    opt.parse!(ARGV)
+    inout_file_path = ARGV[0]
+    if configuration[:root].nil?
+        configuration[:root] = guess_root_dir_from_inout_file(inout_file_path, configuration)
+        if $debug
+          $stderr.puts "Root dir = #{configuration[:root]}"
+        end
+        if configuration[:makefile].nil?
+            configuration[:makefile] = configuration[:root] + "/makefile"
+        end
+    end
+    if !configuration[:force] && configuration[:type] == "makefile" && File.exist?(configuration[:makefile])
+        $stderr.puts "ERROR: #{configuration[:makefile]} already exists."
+        $stderr.puts "       If you want to overwrite it, add --force option."
+        exit 1
+    end
+    if 0 < $debug
+        print "config="; p configuration
+    end
+    tasks = extract_dag_from_inout_file(inout_file_path, configuration)
+    real_inputs, real_outputs = find_real_inout_files(tasks)
+    if 0 < $debug
+        p "TASKS:", tasks
+        p "INPUTS:", real_inputs
+        p "OUTPUTS:", real_outputs
+    end
+    case configuration[:output_type]
+    when 'makefile'
+        generate_makefile(configuration, tasks, real_inputs, real_outputs)
+    else
+        $stderr.puts "ERROR: output type '#{configuration[:output_type]}' is not yet implemented"
+    end
+end
+
+if __FILE__ == $0
+    $debug = 0
+    main
+end
+
+__END__
+
+=head1 NAME
+
+edag - Dependency analyzer for REMarks
+
+=head1 SYNOPSIS
+
+edag [options...] <a log file of in/out files>
+
+Options:
+    -r rootdir          specify the root working directory
+    -f makefile_name    name the name of the output makefile
+    -t type             specify the type of the output file
+    --force             overwrite existing file
+    --system            include system directories for file tracking (e.g., /etc, /usr)
+    --temp              include temporary directories for file tracking (e.g, /tmp)
+    --failed            include failed processes (i.e., process exited with a non-zero exit code)
+    --debug             output debug messages
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--notrack>
+
+B<edag> tracks files accessed by programs user executed. B<--notrack> disables this feature.
+You may need to turn off tracking when your program is not compatible with tracking.
+Adding B<--notrack> makes it work work faster, so you can add B<--notrack> if you do not need tracking.
+
+=back
+
+=head1 DESCRIPTION
+
+B<edag> is designed to keep records of what you type in command line, and help you annotate the command lines you executed.
+
+=cut
+

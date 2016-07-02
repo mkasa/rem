@@ -1,0 +1,1130 @@
+#!/usr/bin/env perl
+# -*- mode:cperl; cperl-indent-level:4; tab-width:4 -*-
+# vim: ts=4:sw=4
+
+use strict;
+use Getopt::Long;
+use POSIX;
+use Pod::Usage;
+
+# CONSTANTS
+
+use constant PRELOAD_LIBRARY_DIR => "/usr/lib/";
+use constant START_TAG  => "\x00\x00\x00\x01\x01\x01\x00\x01\x00\x00\x01\x00";
+use constant END_TAG    => "\x00\x00\x00\x01\x01\x00\x01\x01\x00\x00\x01\x00";
+use constant BEFORE_CMD => "\x00\x00\x00\x01\x01\x01\x01\x00\x00\x00\x01\x00";
+
+our $ini_file = "$ENV{'HOME'}/.remrc";
+our $log_dir  = "$ENV{'HOME'}/.rem";
+
+# FLAGS
+
+my $debug        = 0;
+my $flag_help    = 0;
+my $flag_man     = 0;
+my $flag_init    = 0;
+my $flag_mail    = 0;
+my $flag_md      = 0;
+my $flag_dryrun  = 0;
+my $flag_record  = 0;
+my $flag_append  = 0;
+my $flag_archive = 0;
+my $flag_list    = 0;
+my $flag_notrack = 0;
+my $flag_leavefile = 0;
+my $param_email_limit = undef;
+my $param_session_name = undef;
+our @param_tags   = ();
+
+GetOptions(
+    "--debug"   => \$debug,
+    "--help"    => \$flag_help,
+    "--man"     => \$flag_man,
+    "--init"    => \$flag_init,
+    "--mail"    => \$flag_mail,
+    "--dry"     => \$flag_dryrun,
+    "--md"      => \$flag_md,
+    "--archive" => \$flag_archive,
+    "--record"  => \$flag_record,
+    "--append"  => \$flag_append,
+    "--list"    => \$flag_list,
+    "--notrack" => \$flag_notrack,
+    "--leave"   => \$flag_leavefile,
+    "--limit=i" => \$param_email_limit,
+    "--name=s"  => \$param_session_name,
+    "--tags=s"  => \@param_tags
+);
+if($flag_help) {
+    pod2usage(-verbose => 0);
+    exit 0;
+}
+if($flag_man) {
+    pod2usage(-verbose => 2);
+    exit 0;
+}
+
+# MAIN
+
+if($ENV{'SHELL'} !~ /\bzsh$/) {
+    print STDERR "ERROR: Sorry. You are using $ENV{'SHELL'} but rem supports only zsh at this moment.\n";
+    exit 1;
+}
+
+# SYSTEM COMMANDS
+
+if($flag_record) {
+    my $fname = shift;
+    my $cmdline = shift;
+    my $expanded_cmdline = shift;
+    my $group_number = shift;
+    my $curdir = $ENV{'PWD'};
+    my $home = $ENV{'HOME'};
+    $curdir =~ s|^$home\b|~|;
+    open my $fh, ">>", $fname or die;
+    print $fh "[###]$curdir\[###]$ENV{'HOSTNAME'}\[###]$ENV{'USER'}\[###]" . POSIX::strftime("%Y/%m/%d %H:%M:%S", localtime(time)) . "[###]${cmdline}[###]" . escape_newlines(${expanded_cmdline}) . "[###]$group_number\n";
+    close $fh;
+    exit 0;
+}
+if($flag_append) {
+    my $fname = shift;
+    open my $fh, ">>", $fname or die;
+    print $fh join(' ', @ARGV), "\n";
+    close $fh;
+    exit 0;
+}
+
+# USER COMMANDS (wo/user config)
+
+if($flag_init) {
+    init_init_file();
+    exit 0;
+}
+if($flag_list) {
+    chdir $log_dir or die "Cannot chdir to $log_dir";
+    system "ls -al script_*";
+    exit 0;
+}
+
+# USER COMMANDS (w/user config)
+
+my $ini = read_ini();
+if($ini->{track_level} eq 'none') {
+    $flag_notrack = 1;
+}
+my $prompt_regexp = create_prompt_regexp($ini);
+print STDERR "PROMPT_REGEXP=$prompt_regexp\n" if($debug);
+$param_email_limit = $ini->{email_limit} unless(defined $param_email_limit);
+$param_email_limit = 1000000 unless(defined $param_email_limit);
+if($debug) {
+    print "INFO: e-mail size limit = $param_email_limit\n";
+    print "INFO: prompt regex = $prompt_regexp\n";
+}
+
+my $date_str = `date '+%Y/%m/%d %H:%M:%S'`; chomp $date_str;
+unless($flag_mail || $flag_dryrun || $flag_md) {
+    my $subcmd = shift;
+    if($subcmd =~ /^(start|begin)$/i) {
+        if(defined $ENV{'REM_LOG_FILE'}) {
+            print STDERR "rem session is already started. (file=$ENV{'REM_LOG_FILE'})\n";
+            exit 0;
+        }
+        if($ENV{'LANG'} ne 'C' && $ENV{'LANG'} !~ m|\.utf-8$|i) {
+            print STDERR "WARNING: rem supports only UTF-8, but your LANG is set to $ENV{'LANG'}\n";
+        }
+        if(defined $param_session_name) { $param_session_name = "_" . $param_session_name; }
+        my $ds = $date_str; $ds =~ s|[/ ]|-|g; $ds =~ s|:|-|g;
+        my $hostname = $ENV{'HOSTNAME'};
+        my $home = $ENV{'HOME'};
+        my $fname_final = "$log_dir/script_${ds}_${hostname}_${$}$param_session_name";
+        my $fname = "$fname_final.tmp";
+        $ENV{'REM_LOG_FILE'} = $fname;
+        my $cmdname_final = "$log_dir/cmds_${ds}_${hostname}_${$}$param_session_name";
+        my $cmdname = "$cmdname_final.tmp";
+        $ENV{'REM_CMD_FILE'} = $cmdname;
+        my $inoutname_final = "$log_dir/inout_${ds}_${hostname}_${$}$param_session_name";
+        my $dotdir = "$log_dir/zdot_${ds}_${hostname}_${$}$param_session_name";
+        $ENV{'ZDOTDIR'} = $dotdir;
+        mkdir $dotdir;
+        unless(-d $dotdir) {
+            print STDERR "ERROR: cannot mkdir $dotdir\n";
+            exit 3;
+        }
+        {
+            open my $fh, ">", "$dotdir/.zshenv";
+            print $fh "\nif [ -e $home/.zshenv ] ; then\n\t. $home/.zshenv\nfi\n";
+            close $fh;
+        }
+        {
+            open my $fh, ">", "$dotdir/.zprofile";
+            print $fh "\nif [ -e $home/.zprofile ] ; then\n\t. $home/.zprofile\nfi\n";
+            close $fh;
+        }
+        my $preload_library_path;
+        {
+            $preload_library_path = PRELOAD_LIBRARY_DIR . "/libremlog.";
+            if($^O =~ /darwin/) {
+                $preload_library_path .= "dynlib";
+            } else { 
+                $preload_library_path .= "so";
+            }
+        }
+        {
+            open my $fh, ">", "$dotdir/.zshrc";
+            print $fh "\nif [ -e $home/.zshrc ] ; then\n\t. $home/.zshrc\nfi\n";
+            if($flag_notrack) {
+                print $fh "preexec() {\n";
+                print $fh "    echo -n \"" . BEFORE_CMD ."\"\n";
+                print $fh "    $0 --record $cmdname \$1 \$3\n";
+                print $fh "}\n";
+                print $fh "precmd() {\n";
+                print $fh "    echo \\\[///\\\]\$?\\\[///\\\]`date '+\%Y/\%m/\%d \%H:\%M:\%S'` >> $cmdname\n";
+                print $fh "}\n";
+            } else {
+                print $fh "preexec() {\n";
+                print $fh "    echo -n \"" . BEFORE_CMD ."\"\n";
+                print $fh "    env LD_PRELOAD= $0 --record $cmdname \$1 \$3 \$REM_LOG_COUNT\n";
+                print $fh "}\n";
+                print $fh "rem_log() {\n";
+                print $fh "    export REM_LOG_COUNT=\$[ \$REM_LOG_COUNT + 1 ]\n";
+                # print $fh "    env LD_PRELOAD= $0 --record $cmdname \$BUFFER \$REM_LOG_COUNT\n";
+                print $fh "    env LD_PRELOAD= $0 --append $cmdname \\\[///\\\]\$?\\\[///\\\]`date '+\%Y/\%m/\%d \%H:\%M:\%S'`\n";
+                print $fh "    zle accept-line\n";
+                print $fh "}\n";
+                print $fh "precmd() {\n";
+                print $fh "    env LD_PRELOAD= $0 --append $cmdname \\\[///\\\]\$?\\\[///\\\]`date '+\%Y/\%m/\%d \%H:\%M:\%S'`\n";
+                print $fh "    export REM_LOG_COUNT=\$[ \$REM_LOG_COUNT + 1 ]\n";
+                print $fh "}\n";
+                print $fh "\nzle -N rem_log_widget rem_log\n\n";
+                print $fh "bindkey '^J' rem_log_widget\n";
+                print $fh "bindkey '^M' rem_log_widget\n";
+                print $fh "export REM_LOG_COUNT=1\n";
+                print $fh "export REM_LOG_TRACKING_FILE=$dotdir/track_\\?\n";
+                # print $fh "export LD_PRELOAD=$preload_library_path\n";
+                print $fh "\n";
+            }
+            close $fh;
+        }
+        # check existing sessions
+        {
+            my @existing_script_file_names = <$log_dir/script_*.tmp>;
+            if(0 < @existing_script_file_names) {
+                print STDERR "There are " . scalar(@existing_script_file_names) . " existing sessions running.\n";
+                for(@existing_script_file_names) {
+                    # script_2014-03-02-20-30-11_host_17436
+                    if(/script_(\d\d\d\d)-(\d\d)-(\d\d)-(\d\d)-(\d\d)-(\d\d)_(.*?)_(\d+)/) {
+                        my ($session_host, $process_id) = ($7, $8);
+                        if($session_host eq $ENV{'HOSTNAME'}) {
+                            unless(-e "/proc/$process_id") {
+                                print STDERR "WARNING: rem session $process_id does not exist on $session_host.\n";
+                                print STDERR "         Maybe it was terminated unintentionally.\n";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        # start a new session
+        # system "script $fname -c 'strace -v -f -e trace=open,execve -o $dotdir/trackmaster -- $ENV{'SHELL'} -i -l'";
+        $ENV{'REM_LOG_COUNT'} = '0';
+        $ENV{'REM_LOG_TRACKING_FILE'} = "$dotdir/track_?";
+        system "script $fname -c 'env LD_PRELOAD=$preload_library_path $ENV{'SHELL'} -i -l'";
+        my $rename_res1 = rename $fname, $fname_final;
+        my $rename_res2 = rename $cmdname, $cmdname_final;
+        unless($rename_res1 && $rename_res2) {
+            print STDERR "ERROR: could not rename $fname or $cmdname\n";
+            exit 2;
+        }
+        create_inout_file($dotdir, $inoutname_final, $flag_leavefile);
+        unless($flag_leavefile) {
+            system "rm $dotdir/.z*";
+            system "rmdir $dotdir";
+        }
+
+        if($ini->{default_action} eq 'none') {
+            print STDERR "To check the output in HTML mail:\n";
+            print STDERR "  $0 --dry $fname_final\n";
+            print STDERR "To send an HTML mail:\n";
+            print STDERR "  $0 --mail $fname_final\n";
+            print STDERR "To show a MarkDown text:\n";
+            print STDERR "  $0 --md $fname_final\n";
+            print STDERR "To move the files to the archive:\n";
+            print STDERR "  $0 (--mail|--md) --archive $fname_final\n";
+        } elsif($ini->{default_action} eq 'email' || $ini->{default_action} eq 'emaila') {
+            my $archive_opt = $ini->{default_action} eq 'emaila' ? " --archive" : "";
+            my $tag_param = '';
+            for(@param_tags) {
+                $tag_param .= ' --tags ' . $_;
+            }
+            my $email_param = defined $param_email_limit ? " --limit=$param_email_limit" : '';
+            system "$0 --mail$archive_opt $fname_final$tag_param$email_param";
+        } elsif($ini->{default_action} eq 'md' || $ini->{default_action} eq 'mda') {
+            my $archive_opt = $ini->{default_action} eq 'mda' ? " --archive" : "";
+            system "$0 --md$archive_opt $fname_final";
+        } else {
+            die "Logic error";
+        }
+        exit 0;
+    } elsif($subcmd =~ /^\s*(on|off)\s*$/i) {
+        unless(defined $ENV{'REM_LOG_FILE'}) {
+            print STDERR "rem session is not yet started.\n";
+            exit 0;
+        }
+        my $arg = $1;
+        if($arg =~ /on/i) {
+            print START_TAG . "\n";
+            open my $fh, ">>", $ENV{'REM_CMD_FILE'} or die;
+            print $fh "[***]on\n";
+            close $fh;
+        } elsif($arg =~ /off/i) {
+            print END_TAG . "\n";
+            open my $fh, ">>", $ENV{'REM_CMD_FILE'} or die;
+            print $fh "[***]off\n";
+            close $fh;
+        } else {
+            open my $fh, ">>", $ENV{'REM_CMD_FILE'} or die;
+            print $fh "[***]$subcmd\n";
+            close $fh;
+        }
+        exit 0;
+    } else {
+        exit 0;
+    }
+    # should never reach here
+}
+
+# create an HTML (or Markdown) log, and may archive files
+unless(defined $ini->{from}) {
+    print STDERR "ERROR: $ini_file misses 'from='\n";
+    exit 1;
+}
+unless(defined $ini->{mail}) {
+    print STDERR "ERROR: $ini_file misses 'mail='\n";
+    exit 2;
+}
+
+my $input_script_file_name = shift;
+my $input_cmd_file_name = shift;
+my $input_inout_file_name = shift;
+unless(defined $input_script_file_name) {
+    unless(exists $ENV{'REM_LOG_FILE'}) {
+        print STDERR "usage: rem (start|on|off)\n";
+        print STDERR "\trem start\t\tstart a rem sesseion.\n";
+        print STDERR "\trem on\t\tstart logging outputs.\n";
+        print STDERR "\trem off\t\tend logging outputs.\n";
+        print STDERR "\trem --list\t\tlist the script files.\n";
+    }
+    exit 0;
+}
+
+# We can specify only a script file, in which case we guess the name of the other files.
+unless($input_cmd_file_name) {
+    $input_cmd_file_name = $input_script_file_name;
+    $input_cmd_file_name =~ s!(^|/)script_!$1cmds_!;
+}
+my $output_inout_full_file_name;
+unless($input_inout_file_name) {
+    $input_inout_file_name = $input_script_file_name;
+    $input_inout_file_name =~ s!(^|/)script_!$1inout_!;
+    $output_inout_full_file_name = "$input_inout_file_name.full.json";
+}
+unless($input_cmd_file_name =~ m|^/|) {
+    $input_cmd_file_name = "$log_dir/$input_cmd_file_name";
+}
+unless($input_script_file_name =~ m|^/|) {
+    $input_script_file_name = "$log_dir/$input_script_file_name";
+}
+unless($flag_notrack) {
+    unless($input_inout_file_name =~ m|^/|) {
+        $input_inout_file_name = "$log_dir/$input_inout_file_name";
+    }
+}
+
+# Let's do conversion.
+
+open my $scr, "<", $input_script_file_name or die "Cannot open '$input_script_file_name'";
+open my $cmd, "<", $input_cmd_file_name or die "Cannot open '$input_cmd_file_name'";
+print STDERR "CMD_FILE: $input_cmd_file_name\n" if($debug);
+my $ino;
+my $ino_out;
+my $ino_next_line;
+unless($flag_notrack) {
+    open $ino, "<", $input_inout_file_name or die "Cannot open '$input_inout_file_name'";
+    open $ino_out, ">", $output_inout_full_file_name or die "Cannot open '$output_inout_full_file_name' for output";
+}
+
+my $ofh;
+if($flag_mail && !$flag_dryrun) {
+    open $ofh, "| sendmail -t -f $ini->{from}" or die;
+}
+if($flag_dryrun || $flag_md) {
+    $ofh = *STDOUT;
+}
+
+my $outp = Outputter->new($flag_md ? 'md' : 'html', $ofh, $ini, $date_str);
+$outp->print_header();
+my $push_backed_line = undef;
+while(defined($push_backed_line) || ($_ = <$cmd>)) {
+    if(defined($push_backed_line)) {
+        $_ = $push_backed_line;
+        $push_backed_line = undef;
+    }
+    chomp;
+    if(/^\[###\]/) {
+        # the code below is replicated later.
+        my ($dummy, $dir, $host, $user, $date, $raw_cmd, $exp_cmd, $log_num) = split(/\[###\]/);
+        unless($flag_notrack) {
+            unless(defined $ino_next_line) {
+                $ino_next_line = <$ino>;
+                if(defined $ino_next_line) { chomp $ino_next_line; }
+            }
+            if(defined $ino_next_line) {
+                if($ino_next_line =~ m|^{"num":\s*(\d+)(,.*})$|) {
+                    my ($num, $rest) = ($1, $2);
+                    if($num == $log_num) {
+                        my $exit_and_date_status = <$cmd>;
+                        unless($exit_and_date_status =~ m|\[///\]|) {
+                            # print "PUSH_BACK: $exit_and_date_status";
+                            $push_backed_line = $exit_and_date_status;
+                            $exit_and_date_status = <$cmd>;
+                        }
+                        chomp $exit_and_date_status;
+                        # print "EXIT_STAT: $exit_and_date_status\n";
+                        my ($dummy2, $exit_code, $end_date) = split(m|\[///\]|, $exit_and_date_status);
+                        # print STDERR "LINE: $exit_and_date_status\nEXIT: $exit_code\tEND: $end_date\n";
+                        print $ino_out "{\"num\": $num, \"cmd\": " . adhoc_json_string_quote($raw_cmd);
+                        print $ino_out ", \"exp_cmd\": " . adhoc_json_string_quote($exp_cmd);
+                        print $ino_out ", \"host\": " . adhoc_json_string_quote($host);
+                        print $ino_out ", \"user\": " . adhoc_json_string_quote($user);
+                        print $ino_out ", \"pwd\": " . adhoc_json_string_quote($dir);
+                        print $ino_out ", \"start_date\": " . adhoc_json_string_quote($date);
+                        print $ino_out ", \"end_date\": " . adhoc_json_string_quote($end_date);
+                        print $ino_out ", \"exec_time\": " . (date_string_to_unix_time($end_date) - date_string_to_unix_time($date));
+                        print $ino_out ", \"retcode\": " . scalar($exit_code + 0);
+                        print $ino_out "$rest\n";
+                        $ino_next_line = undef;
+                    }
+                } else {
+                    print STDERR "WARNING: could not parse the following line.\n$ino_next_line\n";
+                }
+            }
+        }
+        if($raw_cmd =~ m|^\s*rem\s+(.*)$|) {
+            # print "DETECTED: rem on/off\n";
+            my $onoff = $1;
+            if($onoff =~ /^\s*on\s*$/i) {
+                my $st = START_TAG;
+                while(<$scr>) { last if(/$st/); }
+                my $ed = END_TAG;
+                SCR_LOOP: while(<$scr>) {
+                    # print "LOADING: " . escape($_) . "\n";
+                    # print "INTERPR: " . interpret_as_terminal($_) . "\n";
+                    last if(/$ed/);
+                    if(/$prompt_regexp/) {
+                        my $chunk = BEFORE_CMD;
+                        my @possible_amari = split(/$chunk/);
+                        # print scalar(@possble_amari), "\n";
+                        my $my_cmd_line = shift @possible_amari;
+                        if($my_cmd_line eq '') { $my_cmd_line = shift @possible_amari; }
+                        # print "RAW    : " . escape($_) . "\n";
+                        # print "PROMPT : " . escape($my_cmd_line) . "\n";
+                        # print "INTERP : " . interpret_as_terminal($my_cmd_line) . "\n";
+                        $my_cmd_line = interpret_as_terminal($my_cmd_line);
+                        $my_cmd_line =~ s|\s+$||;
+                        my $replaced_cmd;
+                        if($my_cmd_line =~ /^($prompt_regexp|)$/) {
+                            # print $ofh "DETECTED_BLANK_LINE\n";
+                        } else {
+                            my $nline;
+                            while(1) {
+                                $nline = <$cmd>;
+                                chomp $nline;
+                                # print "SKIP: $nline\n";
+                                last if($nline =~ m|^\[###\]|);
+                            }
+                            # print $ofh "TOOK CMD: $nline\n";
+                            # print $ofh $nline;
+                            # the code below is replicated before.
+                            my ($dummy, $dir, $host, $user, $date, $raw_cmd) = split(/\[###\]/, $nline);
+                            if($raw_cmd =~ m|^\s*rem\s+(.*)|) {
+                                my $onoff = $1;
+                                $outp->put_comment($onoff) unless($onoff =~ /^(on|off)\s*$/);
+                            } else {
+                                $replaced_cmd = "\[$user\@$host\]$dir\% $raw_cmd";
+                            }
+                        }
+                        if(defined $replaced_cmd || 0 < @possible_amari) {
+                            $outp->put_command_line($replaced_cmd) if(defined $replaced_cmd);
+                            for(@possible_amari) {
+                                my $tm_str = interpret_as_terminal($_, 1); $tm_str =~ s|\s+$||;
+                                $outp->put_command_line($tm_str);
+                            }
+                        }
+                    } else {
+                        my $tm_str = interpret_as_terminal($_, 1); $tm_str =~ s|\s+$||;
+                        $outp->put_command_line($tm_str);
+                    }
+                }
+            } elsif($onoff =~ /^\s*off\s*$/i) {
+            } else {
+                $outp->put_comment($onoff);
+            }
+        } else {
+            $outp->put_command_line("\[$user\@$host\]$dir\% $raw_cmd\n");
+        }
+    } elsif(/^\[\*\*\*\](.*)/) {
+    } elsif(m|^\[///\](.*)|) {
+    } else {
+        $outp->put_command_line($_);
+    }
+    if($outp->size > $param_email_limit ) {
+        print STDERR "ERROR: The size of the output exceeded the limit ($param_email_limit).\n";
+        print STDERR "       The output was truncated.\n";
+        last;
+    }
+}
+$outp->print_footer();
+
+unless($flag_notrack) {
+    close $ino_out;
+    close $ino;
+}
+close $ofh;
+close $cmd;
+close $scr;
+
+if($flag_archive) {
+    print STDERR "Archiving ...\n";
+    sub get_archived_file_name {
+        my $fn = shift;
+        if($fn =~ m!^(/|\.)!) {
+            $fn =~ s!(.*)/(script|cmds|inout)_!$1/archive/$2_!;
+        } else {
+            $fn = "archive/$fn";
+        }
+        return $fn;
+    }
+    sub archive_file {
+        my $f = shift;
+        my $moved_f = get_archived_file_name($f);
+        rename $f, $moved_f or die "Cannot move '$f' to '$moved_f'";
+    }
+    archive_file($input_script_file_name);
+    archive_file($input_cmd_file_name);
+    unless($flag_notrack) {
+        archive_file($input_inout_file_name);
+        archive_file($output_inout_full_file_name);
+    }
+    print STDERR "Successfully archived.\n";
+}
+
+#Everything's done.
+exit 0;
+
+sub create_inout_file {
+    my ($directory, $output_file_name, $flag_leavefile) = @_;
+
+    my @track_globbed_files = <$directory/track*>;
+    my @tracking_files;
+    my $max_track_number = -1;
+
+    open my $ofh, ">", $output_file_name or die "Cannot open '$output_file_name' for output";
+
+    for(@track_globbed_files) {
+        unless(m|^.*/track_(\d+)-(\d+)$|) {
+            print STDERR "ERROR: Logic error. (fn=$_)\n";
+        } else {
+            my $log_number = $1;
+            my $pid = $2;
+            $max_track_number = $log_number if($max_track_number < $log_number);
+            if(3 <= $log_number && $log_number % 2 == 1) {
+                push(@tracking_files, {file => $_, order => $log_number});
+            }
+        }
+    }
+
+    @tracking_files = sort { $a->{order} <=> $b->{order} } @tracking_files;
+
+    for my $file_obj (@tracking_files) {
+        open my $fh, "<", $file_obj->{file} or die;
+        # print "$file_obj->{file}:\n";
+        my %input_files;
+        my %output_files;
+        my %temp_files;
+        while(<$fh>) {
+            chomp;
+            my ($abs_path, $abs_path2, @f) = split(/\t/);
+            my $cmd = join("\t", @f);
+            if($cmd =~ m|^open(64)?\("(.*)", (\d+)\)|) {
+                my ($fname, $mode) = ($2, $3);
+                if(($mode & 3) == 0) {
+                    # REPLICATE 1A: (SEE 2A WHEN MODIFYING)
+                    unless(exists $temp_files{$abs_path}) {
+                        $input_files{$abs_path}++;
+                    } else {
+                        if(exists $output_files{$abs_path}) {
+                            $temp_files{$abs_path}++;
+                            delete $output_files{$abs_path};
+                        }
+                    }
+                } else {
+                    # REPLICATE 1B: (SEE 2B WHEN MODIFYING)
+                    unless(exists $temp_files{$abs_path}) {
+                        $output_files{$abs_path}++;
+                    }
+                }
+            } elsif($cmd =~ m|^f(re)?open(64)?\("(.*)", "(.*)"\)|) {
+                my ($fname, $mode) = ($3, $4);
+                unless($mode =~ /[aw]/i) {
+                    # REPLICATE 2A:
+                    unless(exists $temp_files{$abs_path}) {
+                        $input_files{$abs_path}++;
+                    } else {
+                        if(exists $output_files{$abs_path}) {
+                            $temp_files{$abs_path}++;
+                            delete $output_files{$abs_path};
+                        }
+                    }
+                } else {
+                    # REPLICATE 2B:
+                    unless(exists $temp_files{$abs_path}) {
+                        $output_files{$abs_path}++;
+                    }
+                    $output_files{$abs_path}++;
+                }
+            } elsif($cmd =~ m{^(truncate|creat|link|symlink)(64)?\("(.*)"\)}) {
+                my $fname = $3;
+                unless(exists $temp_files{$abs_path}) {
+                    $output_files{$abs_path}++;
+                }
+            } elsif($cmd =~ m{^rename\("(.*)", "(.*)"\)}) {
+                my ($src, $dest) = ($1, $2);
+                if(exists $temp_files{$abs_path2}) {
+                    $temp_files{$abs_path}++;
+                } else {
+                    if(exists $output_files{$abs_path2}) {
+                        delete $output_files{$abs_path2};
+                        $output_files{$abs_path}++;
+                    } else {
+                        if(exists $input_files{$abs_path2}) {
+                            $output_files{$abs_path2}++;
+                            $output_files{$abs_path}++;
+                        } else {
+                            $output_files{$abs_path}++;
+                        }
+                    }
+                }
+            } else {
+                print STDERR "ERROR: Unknown log: $cmd\n";
+            }
+        }
+        close $fh;
+        print $ofh "{\"num\": $file_obj->{order}";
+        print $ofh ", \"inputs\": " . hash_to_json_array_of_key(\%input_files);
+        print $ofh ", \"outputs\": " . hash_to_json_array_of_key(\%output_files);
+        print $ofh ", \"temps\": " . hash_to_json_array_of_key(\%temp_files);
+        print $ofh "}\n";
+    }
+    close $ofh;
+    unless($flag_leavefile) {
+        for(@track_globbed_files) {
+            if(m|^.*/track_(\d+)-(\d+)$|) {
+                unlink $_ or die "Cannot remove $_";
+            }
+        }
+    }
+}
+
+sub adhoc_json_string_quote
+{
+    my $s = shift;
+    my @retval = ('"');
+    my @c = split(//, $s);
+    for(@c) {
+        if($_ eq '"') {
+            push(@retval, "\\\"");
+        } elsif($_ eq "\\") {
+            push(@retval, "\\\\");
+        } else {
+            push(@retval, $_);
+        }
+    }
+    push(@retval, '"');
+    return join('', @retval);
+}
+
+sub hash_to_json_array_of_key
+{
+    my $hash = shift;
+    my @retval = ('[');
+    my $is_first = 1;
+    while(my ($k, $dummy) = each %$hash) {
+        if($is_first) {
+            $is_first = 0;
+        } else {
+            push(@retval, ", ");
+        }
+        push(@retval, adhoc_json_string_quote($k));
+    }
+    push(@retval, ']');
+    return join('', @retval);
+}
+
+sub date_string_to_unix_time
+{
+    my $str = shift;
+    if($str =~ m|(\d+)-(\d+)-(\d+)\s+(\d+):(\d+):(\d+)|) {
+        return mktime($6, $5, $4, $3, $2 - 1, $1);
+    } else {
+        return undef;
+    }
+}
+
+sub read_ini
+{
+    my $retval = {};
+    my $fh;
+    unless(open $fh, "<", $ini_file) {
+        print STDERR "ERROR: Cannot open $ini_file\n";
+        print STDERR "        First, you have to setup your e-mail address.\n";
+        die;
+    }
+    while(<$fh>) {
+        chomp; chop if(/\r$/);
+        s/^\s+//;
+        if(m|(\S+)=(.*)|) {
+            $retval->{$1} = $2;
+        }
+    }
+    close $fh;
+    # check integrity
+    unless(exists $retval->{prompt}) {
+        print STDERR "ERROR: $ini_file does not contain a mandatory key 'prompt'\n";
+        exit 1;
+    }
+    unless(exists $retval->{default_action}) {
+        print STDERR "ERROR: $ini_file does not contain a mandatory key 'default_action'\n";
+        exit 1;
+    }
+    {
+        my $d = $retval->{default_action};
+        if($d ne 'none' && $d ne 'email' && $d ne 'emaila' && $d ne 'md' && $d ne 'mda') {
+            print STDERR "ERROR: default_action key must have one of the following values:\n";
+            print STDERR "           none, email, emaila, md, mda\n";
+            exit 1;
+        }
+    }
+    {
+        my $d = $retval->{track_level};
+        if($d ne 'none' && $d ne 'strict' && $d ne 'userbin' && $d ne 'data') {
+            print STDERR "ERROR: track_level must be one of the following values:\n";
+            print STDERR "           strict, userbin, data, none.\n";
+            exit 1;
+        }
+    }
+    return $retval;
+}
+
+sub init_init_file
+{
+    unless(-e $log_dir) {
+        print STDERR "Creating $log_dir ... ";
+        unless(mkdir $log_dir) {
+            print STDERR "error (mkdir $log_dir)\n";
+            exit 1;
+        }
+        unless(mkdir "$log_dir/archive") {
+            print STDERR "error (mkdir $log_dir/archive)\n";
+            exit 1;
+        }
+        print STDERR "done\n";
+    }
+    unless(-x $ini_file) {
+        open my $fh, ">", $ini_file or die "Cannot open $ini_file\n";
+        print $fh "# Evernote e-mail address. You do not need to set this if you do not use Evernote.\n";
+        print $fh "mail=example\@m.evernote.com\n";
+        print $fh "# Your e-mail address. This is necessary for mails to be accepted by SMTP servers. This is for Evernote, too.\n";
+        print $fh "from=foo\@example.com\n";
+        print $fh "# Default action when a session finished.\n";
+        print $fh "#    none: do nothing\n";
+        print $fh "#    email: send it by e-mail\n";
+        print $fh "#    emaila: same as email, but it also archives the session files\n";
+        print $fh "#    md: show it in Markdown\n";
+        print $fh "#    mda: show it in Markdown and archive the session files\n";
+        print $fh "default_action=none\n";
+        print $fh "# Size limit for e-mail. This is useful for avoiding sending too large e-mails that contain billions lines of console logs. The unit is byte.\n";
+        print $fh "email_limit=1000000\n";
+        print $fh "# Default file tracking level (can be overridden by command line option.\n";
+        print $fh "#    strict:  tracks all files including system libraries and binaries.\n";
+        print $fh "#    userbin: tracks all data files, and executed binaries in non-system directories.\n";
+        print $fh "#    data:    tracks only data files.\n";
+        print $fh "#    none:    do not track any files.\n";
+        print $fh "track_level=userbin\n";
+        print $fh "# Prompt string.\n";
+        my $prompt_string = `$ENV{'SHELL'} -i -c 'echo \$PS1'`; chomp $prompt_string;
+        print $fh "prompt=$prompt_string\n";
+        close $fh;
+    } else {
+        print STDERR "WARNING: There already exists $ini_file, so we skip generating the default ini file.\n";
+    }
+    my $editor = $ENV{'EDITOR'};
+    unless(defined $editor) { $editor = "vi"; }
+    system "$editor $ini_file";
+}
+
+sub create_prompt_regexp
+{
+    my ($ini) = @_;
+    my $ps1 = $ini->{prompt};
+    if($ps1 eq '') {
+        print STDERR "ERROR: prompt is not specified in the ini file.\n";
+        print STDERR "       Probably, you missed to do the following?.\n";
+        print STDERR "          \% echo \$PS1 >> ~/.remrc\n";
+        print STDERR "       If nothing changes after the above command, please edit ~/.remrc manually.\n";
+        exit 1;
+    }
+    my %conv = ('\\d' => '\w+ \w+ \d+',
+                '\\e' => '\x1b',
+                '\\h' => '[A-Za-z0-9\-_]+',
+                '%m'  => '[A-Za-z0-9\-_]+',
+                '\\H' => '[A-Za-z0-9\-_\.]+',
+                '%M'  => '[A-Za-z0-9\-_\.]+',
+                '\\s' => $ENV{'SHELL'},
+                '\\t' => '\d\d:\d\d:\d\d',
+                '\\T' => '\d\d:\d\d:\d\d',
+                '%T'  => '\d\d:\d\d',
+                '%*'  => '\d\d:\d\d:\d\d',
+                '%D'  => '\d\d-\d\d-\d\d',
+                '\\u' => '[A-Za-z0-9\-_\.]+',
+                '%u'  => '[A-Za-z0-9\-_\.]+',
+                '%n'  => '[A-Za-z0-9\-_\.]+',
+                '\\v' => '[\d\.]+',
+                '\\V' => '.*',
+                '\\w' => '[~/\w\d\s\.]+',
+                '\\W' => '[~/\w\d\s\.]+',
+                '%d'  => '[~/\w\d\s\.]+',
+                '%~'  => '[~/\w\d\s\.]+',
+                '\\!' => '\d+',
+                '\\#' => '\d+',
+                '\\$' => '[#\$]',
+                '%#'  => '[#\%]',
+                '\\\\' => '\\',
+                '\\[' => '',
+                '\\]' => '',
+                '\\r' => '\\r',
+                '\\n' => '\\n',
+                '%%'  => '%',
+                '%l'  => '\w+\d+',
+                '$'   => '\$',
+                '^'   => '\^',
+                '@'   => '\@',
+                '['   => '\[',
+                ']'   => '\]'
+            );
+    unless(defined $ps1) {
+        print STDERR "prompt was not set in ~/.remrc\n";
+        print STDERR "Please do the following.\n";
+        print STDERR "\% echo \$PS1 >> ~/.remrc\n";
+        exit 2;
+    }
+    $ps1 =~ s/([\\%].|\$|\^|\@|\[|\])/$conv{$1}/eg;
+    return $ps1;
+}
+
+sub escape {
+    my $s = shift;
+    $s =~ s|\x1b|<ESC>|g;
+    $s =~ s|\x07|<BELL>|g;
+    $s =~ s|\x08|<BS>|g;
+    $s =~ s|\r|<CR>|g;
+    $s =~ s|\n|<LF>|g;
+    return $s;
+}
+
+sub escape_newlines {
+    my $s = shift;
+    $s =~ s|\n|;|g;
+    return $s;
+}
+
+sub interpret_as_terminal {
+    my $s = shift; 
+    my $flag_use_color = 0;
+    my @c = split(//, $s);
+    my @t;
+    my $ti = 0;
+    for(my $ci = 0; $ci < @c; $ci++) {
+        my $z = $c[$ci];
+        if(ord($z) < 32) {
+            # print STDERR "CURSOR at $ci, ord = " . ord($z) . "\n";
+        } else {
+            # print STDERR "($ci)";
+        }
+        if($z eq "\n") {
+            $ti = 0;
+        } elsif($z eq "\r") {
+            $ti = 0;
+        } elsif($z eq "\x1b") {
+            # print STDERR "ESC";
+            my $nc = $c[++$ci];
+            if($nc eq '[') { # START CSI
+                my $col = '';
+                $ci++;
+                while($c[$ci] =~ /[\d;]/) {
+                    $col .= $c[$ci++];
+                }
+                if($col eq '') { $col = -1; } else { $col += 0; }
+                my $sx = $c[$ci];
+                if($sx eq '@') { for(1..$col) {splice(@t, $ti, 0, ' ') } }
+                elsif($sx eq 'C') { $ti += $col == -1 ? 1 : $col; }
+                elsif($sx eq 'D') { $ti -= $col == -1 ? 1 : $col; }
+                elsif($sx eq 'm') {
+                } elsif($sx eq 'K') {
+                    if($col == -1 || $col == 0) {
+                        for(my $i = $ti; $i < @t; $i++) { $t[$i] = ' '; }
+                    } elsif($col == 1) {
+                        for(my $i = 0; $i < $ti; $i++) { $t[$i] = ' '; }
+                    } elsif($col == 2) {
+                        for(my $i = 0; $i < $ti; $i++) { $t[$i] = ' '; }
+                    } else {
+                        print STDERR "ERROR: unknown escape sequence, ESC [ $col K\n";
+                    }
+                }
+            } else {
+                print STDERR "WARNING: unknown escape sequence, ESC $nc\n";
+            }
+        } elsif($z eq "\x8") {
+            $ti--; $ti = 0 if($ti < 0);
+        } elsif($z eq "\a") {
+            # do nothing. bell.
+        } elsif(ord($z) >= 32) { # just character.
+            $t[$ti] = $z;
+            $ti++;
+        } else {
+            my $o = ord($z);
+            if(2 <= $o) {
+                print STDERR "WARNING: unknown character. ord = $o\n";
+            }
+        }
+    }
+    return join('', @t);
+}
+
+package Outputter;
+
+our $style_pre  = "padding: 8px; margin: 6px 0 9px; line-height: 18px; background-color: #f5f5f5; color: #d14; border: 1px solid #e1e1e8;";
+our $style_code = "font-size: 14px; color: #000;";
+
+sub new {
+    my ($class, $mode, $fh, $ini, $date_str) = @_;
+    unless($mode eq 'md' || $mode eq 'html') {
+        die "mode '$mode' is not supported. probably a bug in rem.";
+    }
+    my $self = {
+        mode               => $mode,
+        fh                 => $fh,
+        ini                => $ini,
+        date_str           => $date_str,
+        output_count       => 0,
+        is_in_comment_mode => 1
+    };
+    bless $self, $class;
+    return $self;
+}
+
+sub print_header {
+    my ($self) = @_;
+    unless($self->{mode} eq 'md') {
+        my $subject = "$self->{date_str} #research" . join('', map {" #$_"} @param_tags);
+        print {$self->{fh}} "From: $self->{ini}->{from}\n";
+        print {$self->{fh}} "To: $self->{ini}->{mail}\n";
+        print {$self->{fh}} "Subject: $subject\n";
+        print {$self->{fh}} "Content-Type: text/html; charset=UTF-8\n";
+        print {$self->{fh}} "\n";
+    }
+    unless($flag_md) {
+        print {$self->{fh}} (<< "EOF");
+<html>
+ <body>
+
+EOF
+    }
+    1;
+}
+
+sub ensure_now_in_comment {
+    my ($self) = @_;
+    unless($self->{is_in_comment_mode}) {
+        $self->{is_in_comment_mode} = 1;
+        if($self->{mode} eq 'md') {
+            $self->put("```\n\n");
+        } else {
+            $self->put("</code></pre>");
+        }
+    }
+    1;
+}
+
+sub ensure_now_in_command {
+    my ($self) = @_;
+    if($self->{is_in_comment_mode}) {
+        $self->{is_in_comment_mode} = 0;
+        if($self->{mode} eq 'md') {
+            $self->put("\n```\n");
+        } else {
+            $self->put("<pre style=\"$style_pre\"><code style=\"$style_code\">");
+        }
+    }
+    1;
+}
+
+sub put {
+    my ($self, $str) = @_;
+    print {$self->{fh}} $str;
+    $self->{output_count} += length($str);
+    1;
+}
+
+sub put_comment {
+    my ($self, $str) = @_;
+    $self->ensure_now_in_comment();
+    if($self->{mode} eq 'md') {
+        $self->put($str);
+    } else {
+        $self->put("<p>" . $str . "</p>");
+    }
+    1;
+}
+
+sub put_command_line {
+    my ($self, $str) = @_;
+    $self->ensure_now_in_command();
+    $self->put($str);
+    1;
+}
+
+sub size {
+    my ($self) = @_;
+    return $self->{output_count};
+}
+
+sub print_footer {
+    my ($self) = @_;
+    $self->ensure_now_in_comment();
+    unless($self->{mode} eq 'md') {
+        print {$self->{fh}} "</body></html>\n";
+    }
+    1;
+}
+
+1;
+
+package main;
+
+__END__
+
+=head1 NAME
+
+rem - REMarks: Recording and Annotation Tool for Reproducible Computational Research
+
+=head1 SYNOPSIS
+
+rem [options...] --init
+
+rem [options...] start [--tags=tagname] [--notrack] [--leave] [--limit=n] [--name=s]
+
+rem [options...] on
+
+rem [options...] <comment (other than start/on/off>
+
+rem [options...] off
+
+rem [options...] --list
+
+rem [options...] (--mail|--md) [--archive] [--limit=n] <log file>
+
+   --init            initialize a directory and a config file
+   --name            name a starting session
+   --list            list the running sessions
+   --mail            send a log by e-mail (in HTML)
+   --tag             add tags for Evernote
+   --md              show a log in Markdown format
+   --notrack         do not track file access
+   --dry             dry run
+   --archive         archive the specified session log
+   --leave           leave temporary files (mainly for debugging)
+   --debug           print debug messages
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--notrack>
+
+B<rem> automatically tracks files accessed by programs user executed. B<--notrack> disables this feature.
+You may need to turn off tracking when your program is not compatible with tracking.
+Adding B<--notrack> makes it work work faster, so you can add B<--notrack> if you do not need tracking.
+
+=item B<--init>
+
+You need to run B<rem --init> before you use B<rem>.
+It creates ~/.rem and the template configuration file, .remrc, which will be edited by user.
+
+=item B<--list>
+
+List the runnign sessions of B<rem>. This might also help you find orphaned sessions (aborted session).
+
+=item B<--mail>
+
+Send by e-mail the HTML log generated by rem.
+You cannot use B<--mail> with B<--md>.
+
+=item B<--limit>
+
+Limit the maximum size (in bytes) of e-mails to be sent.
+This option is useful for avoiding too large log files.
+
+=item B<--md>
+
+Output in Markdown format.
+You cannot use B<--md> with B<--mail>.
+
+=item B<--dry>
+
+This option is used together with B<--md> or B<--mail>.
+Perform a dry run. It shows what is going to happen, but does not actually execute it.
+
+=item B<--archive>
+
+This option is used together with B<--md> or B<--mail>.
+After sending an e-mail (--mail) or displaying a Markdown file (--md),
+log files are moved to the archiving directory (~/.rem/archive).
+
+=item B<--tag>
+
+When you send a log generated by B<rem> to Evernote, you can add a tag(s) for that note with B<--tag>.
+
+=item B<--name>
+
+When you start a rem session, the session name will be the current date and time.
+You can add a string to the session name so that you can easily recognize which session is doing what.
+The allowed characters are any characters valid for file names.
+
+=item B<--leave>
+
+B<--leave> only works with B<rem start>. B<rem> removes temporary files by default, but with B<--leave>, B<rem> leaves temporary files.
+This feature may be useful for debugging.
+
+=item B<--debug>
+
+For debugging purposes only.
+If you wish to send a bug report to the author, attaching the log with this option might help the author figure out what is wrong.
+
+=back
+
+=head1 DESCRIPTION
+
+B<rem> is designed to keep records of what you type in command line, and help you annotate the command lines you executed.
+B<rem> logs your command line, and keeps track of files accessed.
+
+=cut
+
